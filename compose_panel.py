@@ -1,35 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
+import json
+import shlex
+import subprocess
 import threading
 import queue
-import datetime
+from pathlib import Path
 
 import customtkinter as ctk
-import docker
-import requests
-import urllib3
+from tkinter import filedialog, messagebox
 
 
-# ---- Глобальные настройки темы ----
-ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+PRESET_COMMANDS = ["docker compose", "docker-compose"]
+PRESET_SUBCOMMANDS = [
+    "up -d", "up", "down", "restart", "stop", "start", "pull", "ps",
+    "logs --tail=100",
+]
 
-LOG_FONT = ("monospace", 12)
+CONFIG_PATH = Path.home() / ".config" / "check_logs" / "compose.json"
 
-COLOR_STOPPED        = "#8b2c2c"
-COLOR_STOPPED_HOVER  = "#a53a3a"
-COLOR_RUNNING        = "#2f7d32"
-COLOR_RUNNING_HOVER  = "#3b9640"
-COLOR_TAB_IDLE       = "#3a3a3a"
-COLOR_TAB_IDLE_HOVER = "#4a4a4a"
-COLOR_TAB_ACTIVE     = "#2a5d9f"
-COLOR_TAB_ACTIVE_HOV = "#3370b8"
+# Пороги обрезки в символах
+DIR_MAX_LEN = 40
+CMD_MAX_LEN = 55
 
+#  Tooltip
 
-# =====================================================================
-#  ToolTip
-# =====================================================================
 class ToolTip:
     """Всплывающая подсказка для CustomTkinter-виджетов."""
     _active = None
@@ -101,552 +98,405 @@ class ToolTip:
         if ToolTip._active is self:
             ToolTip._active = None
 
+#  Панель Compose
 
-# =====================================================================
-#  Основное окно
-# =====================================================================
-class ModernLogReader(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+class ComposePanel(ctk.CTkToplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Docker Compose — задачи")
+        self.geometry("950x720")
+        self.minsize(800, 560)
 
-        self.title("Docker Log Reader — Modern UI")
-        self.geometry("1200x720")
-        self.minsize(900, 500)
-
-        # --- Структуры данных ---
-        self.logs = {}            # name -> list[str]
-        self.streams = {}         # name -> generator
-        self.threads = {}         # name -> Thread
-        self.active = set()       # имена контейнеров со стримом
-
-        # Левая панель
-        self.left_toggles = {}    # name -> CTkButton (▶/■)
-        self.left_names = {}      # name -> CTkButton (только фокус)
-        self.left_tooltips = {}   # name -> ToolTip
-
-        # Правый таб-бар
-        self.tab_buttons = {}     # name -> CTkButton
-        self.tab_frames = {}      # name -> CTkFrame
-        self.tab_texts = {}       # name -> CTkTextbox
-        self.current_tab = None
-
-        self.closing = set()
-        self.line_queue = queue.Queue()
-
-        # Docker-клиент
-        try:
-            self.client = docker.from_env()
-        except Exception as e:
-            ctk.CTkLabel(
-                self,
-                text=f"Не удалось подключиться к Docker:\n{e}\n\n"
-                     f"Проверьте, что демон запущен и пользователь в группе docker.",
-                text_color="#ff6666",
-            ).pack(padx=20, pady=20)
-            return
+        self.tasks = []            # список словарей dir / cmd / sub / enabled
+        self.output_queue = queue.Queue()
+        self.process = None
+        self.running = False
 
         self._build_ui()
-        self._refresh_containers()
-        self.after(100, self._drain_queue)
+        self._load_config()
+        self._render_tasks()
 
-    # =================================================================
+        self.after(100, self._drain_output)
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
     #  UI
-    # =================================================================
+  
     def _build_ui(self):
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        pad = {"padx": 12, "pady": 6}
 
-        # ---------- Левая панель ----------
-        left = ctk.CTkFrame(self, width=280, corner_radius=0)
-        left.grid(row=0, column=0, sticky="nsew")
-        left.grid_propagate(False)
+        # Форма добавления
+        form = ctk.CTkFrame(self, corner_radius=8)
+        form.pack(fill="x", **pad)
 
         ctk.CTkLabel(
-            left, text="Контейнеры",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        ).pack(anchor="w", padx=16, pady=(16, 4))
+            form, text="Добавить задачу",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(8, 4))
 
-        ctk.CTkLabel(
-            left,
-            text="▶ — открыть вкладку и запустить стрим.\n"
-                 "■ — остановить стрим и закрыть вкладку.\n"
-                 "Клик по имени — переключиться на открытую вкладку.",
-            font=ctk.CTkFont(size=11),
-            text_color="#9a9a9a",
-            wraplength=240,
-            justify="left",
-        ).pack(anchor="w", padx=16, pady=(0, 8))
+        # Директория
+        dir_row = ctk.CTkFrame(form, fg_color="transparent")
+        dir_row.pack(fill="x", padx=10, pady=(0, 4))
 
-        self.list_frame = ctk.CTkScrollableFrame(left, label_text="")
-        self.list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-        # --- Кнопки Старт всех / Стоп всех ---
-        row2 = ctk.CTkFrame(left, fg_color="transparent")
-        row2.pack(fill="x", padx=8, pady=(0, 4))
-        ctk.CTkButton(
-            row2, text="▶ Старт всех", command=self.start_all,
-            corner_radius=8, fg_color=COLOR_RUNNING,
-            hover_color=COLOR_RUNNING_HOVER,
-        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(
-            row2, text="■ Стоп всех", command=self.stop_all,
-            corner_radius=8, fg_color=COLOR_STOPPED,
-            hover_color=COLOR_STOPPED_HOVER,
-        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
-
-        ctk.CTkButton(
-            left, text="🐳 Docker Compose",
-            command=self._open_compose_panel,
-            corner_radius=8, fg_color="#2a5d9f", hover_color="#3370b8",
-        ).pack(fill="x", padx=8, pady=(0, 4))
-
-        ctk.CTkButton(
-            left, text="⟳ Обновить список",
-            command=self._refresh_containers,
-            corner_radius=8, fg_color="transparent", border_width=1,
-        ).pack(fill="x", padx=8, pady=(0, 8))
-
-        self.filter_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
-            left, text="Только CRITICAL/ERROR",
-            variable=self.filter_var,
-        ).pack(anchor="w", padx=16, pady=(4, 0))
-
-        self.theme_switch = ctk.CTkSwitch(
-            left, text="Тёмная тема",
-            command=self._toggle_theme,
+        ctk.CTkLabel(dir_row, text="Директория:", width=90,
+                     anchor="w").pack(side="left")
+        self.dir_entry = ctk.CTkEntry(
+            dir_row, placeholder_text="/path/to/compose/dir",
         )
-        self.theme_switch.select()
-        self.theme_switch.pack(anchor="w", padx=16, pady=(12, 4))
+        self.dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            dir_row, text="📁", width=36, command=self._pick_dir,
+        ).pack(side="left")
+
+        # Команда compose
+        cmd_row = ctk.CTkFrame(form, fg_color="transparent")
+        cmd_row.pack(fill="x", padx=10, pady=(0, 4))
+
+        ctk.CTkLabel(cmd_row, text="Compose:", width=90,
+                     anchor="w").pack(side="left")
+        self.cmd_var = ctk.StringVar(value=PRESET_COMMANDS[0])
+        ctk.CTkComboBox(
+            cmd_row, values=PRESET_COMMANDS, variable=self.cmd_var,
+        ).pack(side="left", fill="x", expand=True)
+
+        # Подкоманда
+        sub_row = ctk.CTkFrame(form, fg_color="transparent")
+        sub_row.pack(fill="x", padx=10, pady=(0, 4))
+
+        ctk.CTkLabel(sub_row, text="Подкоманда:", width=90,
+                     anchor="w").pack(side="left")
+        self.sub_var = ctk.StringVar(value="up -d")
+        ctk.CTkComboBox(
+            sub_row, values=PRESET_SUBCOMMANDS, variable=self.sub_var,
+        ).pack(side="left", fill="x", expand=True)
 
         ctk.CTkButton(
-            left, text="Очистить всё", command=self.clear_all,
-            corner_radius=8, fg_color="#4a4a4a", hover_color="#5a5a5a",
-        ).pack(fill="x", padx=8, pady=(8, 16), side="bottom")
+            form, text="+ Добавить запись",
+            fg_color="#2f7d32", hover_color="#3b9640",
+            command=self._add_task,
+        ).pack(anchor="e", padx=10, pady=(4, 10))
 
-        # ---------- Правая часть ----------
-        right = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
-        right.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
-        right.grid_columnconfigure(0, weight=1)
-        right.grid_rowconfigure(1, weight=1)
+        # Список задач
+        ctk.CTkLabel(
+            self, text="Список задач",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", padx=12, pady=(6, 4))
 
-        # Горизонтально-скроллируемый таб-бар (CTk >= 5.2.0)
-        self.tab_bar = ctk.CTkScrollableFrame(
-            right,
+        # Горизонтальный скроллфрейм (CustomTkinter >= 5.2.0)
+        self.tasks_frame = ctk.CTkScrollableFrame(
+            self,
             orientation="horizontal",
-            corner_radius=0,
-            fg_color="transparent",
-            height=52,
+            height=230,
+            label_text="",
         )
-        self.tab_bar.grid(row=0, column=0, sticky="ew")
+        self.tasks_frame.pack(fill="x", padx=12, pady=(0, 6))
 
-        self.content = ctk.CTkFrame(right, corner_radius=8)
-        self.content.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
-        self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_rowconfigure(0, weight=1)
+        # Кнопки действий
+        actions = ctk.CTkFrame(self, fg_color="transparent")
+        actions.pack(fill="x", **pad)
 
-        self.placeholder = ctk.CTkLabel(
-            self.content,
-            text="Нажмите ▶ слева, чтобы открыть вкладку и запустить стрим.",
-            justify="center",
-            text_color="#9a9a9a",
+        self.run_sel_btn = ctk.CTkButton(
+            actions, text="▶ Выполнить выбранные",
+            fg_color="#2f7d32", hover_color="#3b9640",
+            command=self._run_selected,
         )
-        self.placeholder.grid(row=0, column=0)
+        self.run_sel_btn.pack(side="left", padx=(0, 6))
 
-        # ---------- Статус-бар ----------
-        self.status_label = ctk.CTkLabel(
-            self, text="Готово.", anchor="w",
-            font=ctk.CTkFont(size=12),
-            text_color="#9a9a9a",
+        self.run_all_btn = ctk.CTkButton(
+            actions, text="▶ Выполнить все",
+            fg_color="#2a5d9f", hover_color="#3370b8",
+            command=self._run_all,
         )
-        self.status_label.grid(row=1, column=0, columnspan=2,
-                               sticky="ew", padx=16, pady=(0, 8))
+        self.run_all_btn.pack(side="left", padx=(0, 6))
 
-    # =================================================================
-    #  Список контейнеров (слева)
-    # =================================================================
-    def _refresh_containers(self):
-        active_before = set(self.active)
+        self.stop_btn = ctk.CTkButton(
+            actions, text="■ Прервать",
+            fg_color="#8b2c2c", hover_color="#a53a3a",
+            state="disabled", command=self._stop,
+        )
+        self.stop_btn.pack(side="left", padx=(0, 6))
 
-        for w in self.list_frame.winfo_children():
+        ctk.CTkButton(
+            actions, text="Очистить вывод",
+            fg_color="transparent", border_width=1,
+            command=self._clear_output,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            actions, text="✕ Закрыть",
+            fg_color="#4a4a4a", hover_color="#5a5a5a",
+            command=self._on_close,
+        ).pack(side="right")
+
+        # Вывод
+        ctk.CTkLabel(
+            self, text="Вывод",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(anchor="w", **pad)
+
+        self.output = ctk.CTkTextbox(
+            self, wrap="word",
+            font=ctk.CTkFont(family="monospace", size=11),
+        )
+        self.output.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    #  Форма добавления
+   
+    def _pick_dir(self):
+        path = filedialog.askdirectory(title="Выберите директорию")
+        if path:
+            self.dir_entry.delete(0, "end")
+            self.dir_entry.insert(0, path)
+
+    def _add_task(self):
+        path = self.dir_entry.get().strip()
+        if not path:
+            self._log("[ERROR] Укажите директорию\n")
+            return
+        if not os.path.isdir(path):
+            self._log(f"[ERROR] Не директория: {path}\n")
+            return
+
+        self.tasks.append({
+            "dir": path,
+            "cmd": self.cmd_var.get().strip() or PRESET_COMMANDS[0],
+            "sub": self.sub_var.get().strip() or "up -d",
+            "enabled": True,
+        })
+        self.dir_entry.delete(0, "end")
+        self._render_tasks()
+
+    #  Отрисовка списка задач
+  
+    def _render_tasks(self):
+        for w in self.tasks_frame.winfo_children():
             w.destroy()
-        self.left_toggles.clear()
-        self.left_names.clear()
-        self.left_tooltips.clear()
 
-        try:
-            containers = sorted(self.client.containers.list(), key=lambda c: c.name)
-        except Exception as e:
-            self.status_label.configure(text=f"Ошибка получения списка: {e}")
+        if not self.tasks:
+            ctk.CTkLabel(
+                self.tasks_frame, text="Задач пока нет.",
+                text_color="#9a9a9a",
+            ).pack(pady=10)
             return
 
-        for c in containers:
-            row = ctk.CTkFrame(self.list_frame, fg_color="transparent")
-            row.pack(fill="x", padx=2, pady=2)
+        for i, task in enumerate(self.tasks):
+            row = ctk.CTkFrame(self.tasks_frame, fg_color="transparent")
+            row.pack(fill="x", pady=2)
 
-            running = c.name in active_before
-            fg = COLOR_RUNNING if running else COLOR_STOPPED
-            hv = COLOR_RUNNING_HOVER if running else COLOR_STOPPED_HOVER
-            sym = "■" if running else "▶"
-
-            toggle = ctk.CTkButton(
-                row,
-                text=sym,
-                width=32, height=28,
-                corner_radius=6,
-                fg_color=fg,
-                hover_color=hv,
-                font=ctk.CTkFont(size=14, weight="bold"),
-                command=lambda n=c.name: self._toggle_stream(n),
+            # Чекбокс
+            var = ctk.BooleanVar(value=task["enabled"])
+            cb = ctk.CTkCheckBox(
+                row, text="", width=24, variable=var,
+                command=lambda idx=i, v=var: self._toggle_task(idx, v.get()),
             )
-            toggle.pack(side="left", padx=(0, 4))
-            self.left_toggles[c.name] = toggle
+            cb.pack(side="left", padx=(0, 4))
 
-            name_btn = ctk.CTkButton(
-                row,
-                text=self._shorten(c.name, 22),
-                anchor="w",
-                height=28,
-                corner_radius=6,
-                fg_color="transparent",
-                hover_color="#3a3a3a",
-                font=ctk.CTkFont(size=12),
-                command=lambda n=c.name: self._focus_tab(n),
+            # Директория (обрезанная, с tooltip)
+            dir_full = task["dir"]
+            dir_text = self._shorten_path(dir_full, DIR_MAX_LEN)
+            dir_lbl = ctk.CTkLabel(
+                row, text=dir_text, anchor="w", justify="left",
+                width=280, wraplength=280,
+                font=ctk.CTkFont(family="monospace", size=11),
             )
-            name_btn.pack(side="left", fill="x", expand=True)
-            self.left_names[c.name] = name_btn
+            dir_lbl.pack(side="left", padx=(0, 8))
+            ToolTip(dir_lbl, dir_full)
 
-            # Tooltip с полным именем контейнера
-            self.left_tooltips[c.name] = ToolTip(name_btn, c.name)
-
-        self._update_status()
-
-    # =================================================================
-    #  Переключение на вкладку (без создания)
-    # =================================================================
-    def _focus_tab(self, name):
-        if name in self.tab_frames:
-            self._show_tab(name)
-        else:
-            self.status_label.configure(
-                text=f"Вкладка '{self._shorten(name, 22)}' закрыта. "
-                     f"Нажмите ▶ слева, чтобы открыть её и запустить стрим."
+            # Команда + подкоманда (обрезанная, с tooltip) 
+            cmd_full = f"{task['cmd']} {task['sub']}"
+            cmd_text = self._shorten_path(cmd_full, CMD_MAX_LEN)
+            cmd_lbl = ctk.CTkLabel(
+                row, text=cmd_text, anchor="w", justify="left",
+                width=420, wraplength=420,
+                font=ctk.CTkFont(family="monospace", size=11),
+                text_color="#a0a0a0",
             )
+            cmd_lbl.pack(side="left", padx=(0, 8))
+            ToolTip(cmd_lbl, cmd_full)
 
-    # =================================================================
-    #  Табы справа
-    # =================================================================
-    def _ensure_tab(self, name):
-        if name in self.tab_frames:
-            return self.tab_frames[name]
+            # Кнопка удаления (прижата вправо) 
+            ctk.CTkButton(
+                row, text="✕", width=32, height=24,
+                fg_color="#8b2c2c", hover_color="#a53a3a",
+                command=lambda idx=i: self._remove_task(idx),
+            ).pack(side="right", padx=(8, 0))
 
-        self.placeholder.grid_remove()
+    def _shorten_path(self, text, max_len):
+        """Обрезает строку, оставляя начало и хвост — удобно для путей."""
+        if len(text) <= max_len:
+            return text
+        # Оставляем начало (для команды) и хвост (для директории)
+        # Простой вариант: оставить только начало + '…'
+        return text[: max_len - 1] + "…"
 
-        btn = ctk.CTkButton(
-            self.tab_bar,
-            text=self._shorten(name, 18),
-            width=180, height=32,
-            corner_radius=8,
-            fg_color=COLOR_TAB_IDLE,
-            hover_color=COLOR_TAB_IDLE_HOVER,
-            font=ctk.CTkFont(size=12),
-            command=lambda n=name: self._show_tab(n),
-        )
-        btn.pack(side="left", padx=(0, 4), pady=4)
-        self.tab_buttons[name] = btn
+    def _toggle_task(self, idx, enabled):
+        if 0 <= idx < len(self.tasks):
+            self.tasks[idx]["enabled"] = enabled
 
-        # Tooltip с полным именем на табе
-        ToolTip(btn, name)
+    def _remove_task(self, idx):
+        if 0 <= idx < len(self.tasks):
+            del self.tasks[idx]
+            self._render_tasks()
+   
+    #  Выполнение
 
-        page = ctk.CTkFrame(self.content, corner_radius=8)
-        page.grid(row=0, column=0, sticky="nsew")
-        page.grid_columnconfigure(0, weight=1)
-        page.grid_rowconfigure(0, weight=1)
-
-        txt = ctk.CTkTextbox(
-            page,
-            wrap="word",
-            corner_radius=6,
-            font=ctk.CTkFont(family=LOG_FONT[0], size=LOG_FONT[1]),
-        )
-        txt.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
-
-        self.tab_frames[name] = page
-        self.tab_texts[name] = txt
-        self.logs.setdefault(name, [])
-
-        if self.current_tab is None:
-            self._show_tab(name)
-
-        # Автопрокрутка таб-бара вправо, чтобы новая вкладка была видна
-        try:
-            self.tab_bar._parent_canvas.xview_moveto(1.0)
-        except AttributeError:
-            pass
-
-        return page
-
-    def _show_tab(self, name):
-        if name not in self.tab_frames:
-            return
-
-        for n, frame in self.tab_frames.items():
-            if n == name:
-                frame.grid()
-            else:
-                frame.grid_remove()
-
-        for n, btn in self.tab_buttons.items():
-            if n == name:
-                btn.configure(fg_color=COLOR_TAB_ACTIVE,
-                              hover_color=COLOR_TAB_ACTIVE_HOV)
-            else:
-                btn.configure(fg_color=COLOR_TAB_IDLE,
-                              hover_color=COLOR_TAB_IDLE_HOVER)
-
-        self.current_tab = name
-
-    def _close_tab(self, name):
-        if name in self.closing:
-            return
-        self.closing.add(name)
-        try:
-            btn = self.tab_buttons.pop(name, None)
-            frame = self.tab_frames.pop(name, None)
-            self.tab_texts.pop(name, None)
-
-            if btn is not None:
-                btn.destroy()
-            if frame is not None:
-                frame.destroy()
-
-            if self.current_tab == name:
-                self.current_tab = None
-                remaining = list(self.tab_frames.keys())
-                if remaining:
-                    self._show_tab(remaining[0])
-                else:
-                    self.placeholder.grid()
-        finally:
-            self.after(0, lambda n=name: self.closing.discard(n))
-
-    # =================================================================
-    #  Управление стримингом
-    # =================================================================
-    def _toggle_stream(self, name):
-        if name in self.active:
-            self._stop_one(name)
-        else:
-            self._start_one(name)
-
-    def start_all(self):
-        for name in list(self.left_toggles.keys()):
-            if name not in self.active:
-                self._start_one(name)
-
-    def stop_all(self):
-        for name in list(self.active):
-            self._stop_one(name)
-
-    def _start_one(self, name):
-        if name in self.active:
-            return
-
-        try:
-            container = self.client.containers.get(name)
-        except docker.errors.NotFound:
-            self.status_label.configure(text=f"'{name}' не найден — пропуск.")
-            return
-        except Exception as e:
-            self.status_label.configure(text=f"Ошибка '{name}': {e}")
-            return
-
-        # 1. Открываем вкладку (инвариант: стрим ⇒ вкладка)
-        self._ensure_tab(name)
-
-        # 2. Помечаем активным, красим индикатор слева
-        self.active.add(name)
-        self._set_left_toggle_state(name, running=True)
-
-        # 3. Служебная строка «Старт»
-        self._append_service_line(name, "▶ Старт стриминга")
-
-        # 4. Запускаем воркер
-        t = threading.Thread(
-            target=self._stream_worker, args=(container,), daemon=True,
-        )
-        self.threads[name] = t
-        t.start()
-
-        # 5. Фокус на новую вкладку
-        self._show_tab(name)
-
-        self._update_status()
-
-    def _stop_one(self, name):
-        if name not in self.active:
-            return
-
-        self.active.discard(name)
-
-        stream = self.streams.get(name)
-        if stream is not None:
+    def _collect_tasks(self, only_selected):
+        result = []
+        for t in self.tasks:
+            if only_selected and not t["enabled"]:
+                continue
             try:
-                stream.close()
-            except Exception:
-                pass
+                cmd = shlex.split(t["cmd"]) + shlex.split(t["sub"])
+            except ValueError as e:
+                self._log(f"[ERROR] '{t['dir']}': {e}\n")
+                continue
+            result.append((t["dir"], cmd))
+        return result
 
-        self._set_left_toggle_state(name, running=False)
+    def _run_selected(self):
+        self._run(self._collect_tasks(only_selected=True))
 
-        # Служебная строка — только в массив (вкладка сейчас закроется)
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.logs.setdefault(name, []).append(
-            f"--- {ts} ■ Стриминг остановлен ---"
-        )
+    def _run_all(self):
+        self._run(self._collect_tasks(only_selected=False))
 
-        # Инвариант: нет стрима ⇒ нет вкладки
-        self._close_tab(name)
-        self._update_status()
-
-    def _set_left_toggle_state(self, name, running):
-        toggle = self.left_toggles.get(name)
-        if toggle is None or not toggle.winfo_exists():
+    def _run(self, jobs):
+        if self.running:
+            self._log("[WARN] Уже выполняется другая команда\n")
             return
-        if running:
-            toggle.configure(
-                text="■",
-                fg_color=COLOR_RUNNING,
-                hover_color=COLOR_RUNNING_HOVER,
-            )
-        else:
-            toggle.configure(
-                text="▶",
-                fg_color=COLOR_STOPPED,
-                hover_color=COLOR_STOPPED_HOVER,
-            )
+        if not jobs:
+            self._log("[ERROR] Нет задач для выполнения\n")
+            return
 
-    def _stream_worker(self, container):
-        name = container.name
+        self.running = True
+        self.run_sel_btn.configure(state="disabled")
+        self.run_all_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+
+        threading.Thread(
+            target=self._run_worker, args=(jobs,), daemon=True,
+        ).start()
+
+    def _run_worker(self, jobs):
         try:
-            stream = container.logs(stream=True, follow=True, tail=0)
-            self.streams[name] = stream
+            for d, cmd_parts in jobs:
+                self.output_queue.put(
+                    ("out", f"\n===== {d} — {' '.join(cmd_parts)} =====\n")
+                )
 
-            for chunk in stream:
-                if name not in self.active:
-                    break
-                line = chunk.decode("utf-8", errors="replace").rstrip()
-                if not line:
+                if not os.path.isdir(d):
+                    self.output_queue.put(
+                        ("err", f"[ERROR] Директория не существует: {d}\n")
+                    )
                     continue
-                if self.filter_var.get():
-                    if "CRITICAL" not in line and "ERROR" not in line:
-                        continue
-                self.line_queue.put((name, line))
 
-        except (requests.exceptions.ChunkedEncodingError,
-                urllib3.exceptions.ProtocolError,
-                OSError):
-            pass
-        except Exception as e:
-            self.line_queue.put((name, f"[STREAM ERROR] {e}"))
+                try:
+                    self.process = subprocess.Popen(
+                        cmd_parts, cwd=d,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1,
+                    )
+                except FileNotFoundError:
+                    self.output_queue.put(
+                        ("err", f"[ERROR] Команда не найдена: {cmd_parts[0]}\n")
+                    )
+                    continue
+
+                for line in self.process.stdout:
+                    self.output_queue.put(("out", line))
+
+                self.process.wait()
+                self.output_queue.put(
+                    ("out", f"[exit code: {self.process.returncode}]\n")
+                )
+                self.process = None
+
         finally:
-            self.streams.pop(name, None)
-            self.line_queue.put((name, None))
+            self.output_queue.put(("done", None))
 
-    # =================================================================
-    #  Разбор очереди
-    # =================================================================
-    def _drain_queue(self):
-        processed = 0
+    def _stop(self):
+        if self.process is not None:
+            try:
+                self.process.terminate()
+                self.output_queue.put(("out", "\n[INFO] Процесс прерван\n"))
+            except Exception as e:
+                self.output_queue.put(("err", f"[ERROR] {e}\n"))
+
+    #  Очередь вывода
+    
+    def _drain_output(self):
         try:
             while True:
-                name, payload = self.line_queue.get_nowait()
-                processed += 1
-
-                if payload is None:
-                    if name in self.active:
-                        self.active.discard(name)
-                        self._set_left_toggle_state(name, running=False)
-                        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        self.logs.setdefault(name, []).append(
-                            f"--- {ts} ■ Стриминг завершён ---"
-                        )
-                        self._close_tab(name)
+                kind, payload = self.output_queue.get_nowait()
+                if kind == "done":
+                    self.running = False
+                    self.run_sel_btn.configure(state="normal")
+                    self.run_all_btn.configure(state="normal")
+                    self.stop_btn.configure(state="disabled")
                     continue
-
-                self.logs.setdefault(name, []).append(payload)
-                txt = self.tab_texts.get(name)
-                if txt is not None and txt.winfo_exists():
-                    txt.insert("end", self._wrap_paths(payload) + "\n")
-                    txt.see("end")
-
+                if payload:
+                    self._log(payload)
         except queue.Empty:
             pass
+        self.after(100, self._drain_output)
 
-        if processed:
-            self._update_status()
-        self.after(100, self._drain_queue)
+    def _log(self, text):
+        self.output.insert("end", text)
+        self.output.see("end")
 
-    def _update_status(self):
-        total = sum(len(v) for v in self.logs.values())
-        active = len(self.active)
-        if active:
-            self.status_label.configure(
-                text=f"Активных стримов: {active} | Всего строк: {total}"
-            )
-        else:
-            self.status_label.configure(text=f"Стримов нет. Всего строк: {total}")
+    def _clear_output(self):
+        self.output.delete("1.0", "end")
 
-    # =================================================================
-    #  Утилиты
-    # =================================================================
-    def _shorten(self, text, max_len=18):
-        return text if len(text) <= max_len else text[: max_len - 1] + "…"
+    #  Персистентность
 
-    def _wrap_paths(self, line):
-        return line.replace("/", "/\u200b")
-
-    def _append_service_line(self, name, text):
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"--- {ts} {text} ---"
-        self.logs.setdefault(name, []).append(line)
-
-        txt = self.tab_texts.get(name)
-        if txt is not None and txt.winfo_exists():
-            txt.insert("end", line + "\n")
-            txt.see("end")
-
-    def _toggle_theme(self):
-        mode = "dark" if self.theme_switch.get() else "light"
-        ctk.set_appearance_mode(mode)
-
-    def clear_all(self):
-        for name in list(self.active):
-            self._stop_one(name)
-        for name in list(self.tab_frames.keys()):
-            self._close_tab(name)
-        self.logs.clear()
-        self.status_label.configure(text="Все превью и массивы очищены.")
-
-    # =================================================================
-    #  Compose-панель
-    # =================================================================
-    def _open_compose_panel(self):
+    def _load_config(self):
+        if not CONFIG_PATH.is_file():
+            return
         try:
-            from compose_panel import ComposePanel
-        except ImportError:
-            self.status_label.configure(
-                text="Модуль compose_panel.py не найден рядом со скриптом."
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            for t in data.get("tasks", []):
+                if isinstance(t, dict) and "dir" in t and "sub" in t:
+                    self.tasks.append({
+                        "dir": t["dir"],
+                        "cmd": t.get("cmd", PRESET_COMMANDS[0]),
+                        "sub": t["sub"],
+                        "enabled": t.get("enabled", True),
+                    })
+        except Exception as e:
+            self._log(f"[WARN] Не удалось загрузить конфиг: {e}\n")
+
+    def _save_config(self):
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data = {"tasks": [
+                {
+                    "dir": t["dir"],
+                    "cmd": t["cmd"],
+                    "sub": t["sub"],
+                    "enabled": t["enabled"],
+                }
+                for t in self.tasks
+            ]}
+            CONFIG_PATH.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
-            return
-        if getattr(self, "_compose_panel", None) is not None \
-                and self._compose_panel.winfo_exists():
-            self._compose_panel.lift()
-            self._compose_panel.focus_force()
-            return
-        self._compose_panel = ComposePanel(self)
+        except Exception as e:
+            self._log(f"[WARN] Не удалось сохранить конфиг: {e}\n")
 
-
-# =====================================================================
-if __name__ == "__main__":
-    app = ModernLogReader()
-    app.mainloop()
+    def _on_close(self):
+        if self.running:
+            if not messagebox.askyesno(
+                "Прервать?",
+                "Идёт команда. Закрыть окно и прервать?",
+                parent=self,
+            ):
+                return
+            self._stop()
+        self._save_config()
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()

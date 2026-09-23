@@ -8,7 +8,7 @@ GUI-приложение на Python для просмотра логов Docker
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 <!-- ↓↓↓ Вставьте сюда скриншот главного окна ↓↓↓ -->
-![Screenshot](docs/screenshot-main.png)
+<!-- ![Screenshot](docs/screenshot-main.png)> --> 
 
 ---
 
@@ -33,7 +33,7 @@ GUI-приложение на Python для просмотра логов Docker
 
 | Главное окно | Панель Compose |
 |---|---|
-| ![Main](docs/screenshot-main.png) | ![Compose](docs/screenshot-compose.png) |
+<!--| ![Main](docs/screenshot-main.png) | ![Compose](docs/screenshot-compose.png) | -->
 
 ---
 
@@ -140,7 +140,7 @@ chmod +x run.sh
 перезапуск приложения.
 
 ---
-
+<!--
 ## Структура проекта
 
 ```
@@ -155,7 +155,7 @@ chmod +x run.sh
 ├── LICENSE
 └── README.md
 ```
-
+-->
 ---
 
 ## Известные ограничения

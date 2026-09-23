@@ -1,0 +1,4 @@
+customtkinter>=5.2.0
+docker>=6.0.0
+requests
+urllib3

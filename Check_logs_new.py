@@ -11,7 +11,7 @@ import requests
 import urllib3
 
 
-# ---- Глобальные настройки темы ----
+# Глобальные настройки темы 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
@@ -26,10 +26,6 @@ COLOR_TAB_IDLE_HOVER = "#4a4a4a"
 COLOR_TAB_ACTIVE     = "#2a5d9f"
 COLOR_TAB_ACTIVE_HOV = "#3370b8"
 
-
-# =====================================================================
-#  ToolTip
-# =====================================================================
 class ToolTip:
     """Всплывающая подсказка для CustomTkinter-виджетов."""
     _active = None
@@ -101,10 +97,8 @@ class ToolTip:
         if ToolTip._active is self:
             ToolTip._active = None
 
-
-# =====================================================================
 #  Основное окно
-# =====================================================================
+
 class ModernLogReader(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -113,21 +107,21 @@ class ModernLogReader(ctk.CTk):
         self.geometry("1200x720")
         self.minsize(900, 500)
 
-        # --- Структуры данных ---
-        self.logs = {}            # name -> list[str]
-        self.streams = {}         # name -> generator
-        self.threads = {}         # name -> Thread
+        # Структуры данных
+        self.logs = {}            # name - list[str]
+        self.streams = {}         # name - generator
+        self.threads = {}         # name - Thread
         self.active = set()       # имена контейнеров со стримом
 
         # Левая панель
-        self.left_toggles = {}    # name -> CTkButton (▶/■)
-        self.left_names = {}      # name -> CTkButton (только фокус)
-        self.left_tooltips = {}   # name -> ToolTip
+        self.left_toggles = {}    # name - CTkButton (старт/стоп)
+        self.left_names = {}      # name - CTkButton (только фокус)
+        self.left_tooltips = {}   # name - ToolTip
 
         # Правый таб-бар
-        self.tab_buttons = {}     # name -> CTkButton
-        self.tab_frames = {}      # name -> CTkFrame
-        self.tab_texts = {}       # name -> CTkTextbox
+        self.tab_buttons = {}     # name - CTkButton
+        self.tab_frames = {}      # name - CTkFrame
+        self.tab_texts = {}       # name - CTkTextbox
         self.current_tab = None
 
         self.closing = set()
@@ -148,15 +142,14 @@ class ModernLogReader(ctk.CTk):
         self._build_ui()
         self._refresh_containers()
         self.after(100, self._drain_queue)
-
-    # =================================================================
+        
     #  UI
-    # =================================================================
+    
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # ---------- Левая панель ----------
+        # Левая панель 
         left = ctk.CTkFrame(self, width=280, corner_radius=0)
         left.grid(row=0, column=0, sticky="nsew")
         left.grid_propagate(False)
@@ -180,7 +173,7 @@ class ModernLogReader(ctk.CTk):
         self.list_frame = ctk.CTkScrollableFrame(left, label_text="")
         self.list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
 
-        # --- Кнопки Старт всех / Стоп всех ---
+        # Кнопки Старт всех / Стоп всех
         row2 = ctk.CTkFrame(left, fg_color="transparent")
         row2.pack(fill="x", padx=8, pady=(0, 4))
         ctk.CTkButton(
@@ -224,7 +217,7 @@ class ModernLogReader(ctk.CTk):
             corner_radius=8, fg_color="#4a4a4a", hover_color="#5a5a5a",
         ).pack(fill="x", padx=8, pady=(8, 16), side="bottom")
 
-        # ---------- Правая часть ----------
+        # Правая часть 
         right = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         right.grid(row=0, column=1, sticky="nsew", padx=12, pady=12)
         right.grid_columnconfigure(0, weight=1)
@@ -253,7 +246,7 @@ class ModernLogReader(ctk.CTk):
         )
         self.placeholder.grid(row=0, column=0)
 
-        # ---------- Статус-бар ----------
+        # Статус-бар
         self.status_label = ctk.CTkLabel(
             self, text="Готово.", anchor="w",
             font=ctk.CTkFont(size=12),
@@ -262,9 +255,8 @@ class ModernLogReader(ctk.CTk):
         self.status_label.grid(row=1, column=0, columnspan=2,
                                sticky="ew", padx=16, pady=(0, 8))
 
-    # =================================================================
     #  Список контейнеров (слева)
-    # =================================================================
+   
     def _refresh_containers(self):
         active_before = set(self.active)
 
@@ -321,9 +313,8 @@ class ModernLogReader(ctk.CTk):
 
         self._update_status()
 
-    # =================================================================
     #  Переключение на вкладку (без создания)
-    # =================================================================
+
     def _focus_tab(self, name):
         if name in self.tab_frames:
             self._show_tab(name)
@@ -333,9 +324,8 @@ class ModernLogReader(ctk.CTk):
                      f"Нажмите ▶ слева, чтобы открыть её и запустить стрим."
             )
 
-    # =================================================================
     #  Табы справа
-    # =================================================================
+
     def _ensure_tab(self, name):
         if name in self.tab_frames:
             return self.tab_frames[name]
@@ -430,9 +420,8 @@ class ModernLogReader(ctk.CTk):
         finally:
             self.after(0, lambda n=name: self.closing.discard(n))
 
-    # =================================================================
     #  Управление стримингом
-    # =================================================================
+   
     def _toggle_stream(self, name):
         if name in self.active:
             self._stop_one(name)
@@ -461,24 +450,24 @@ class ModernLogReader(ctk.CTk):
             self.status_label.configure(text=f"Ошибка '{name}': {e}")
             return
 
-        # 1. Открываем вкладку (инвариант: стрим ⇒ вкладка)
+        # 1 Открываем вкладку
         self._ensure_tab(name)
 
-        # 2. Помечаем активным, красим индикатор слева
+        # 2 Помечаем активным, красим индикатор слева
         self.active.add(name)
         self._set_left_toggle_state(name, running=True)
 
-        # 3. Служебная строка «Старт»
+        # 3 Служебная строка «Старт»
         self._append_service_line(name, "▶ Старт стриминга")
 
-        # 4. Запускаем воркер
+        # 4 Запускаем воркер
         t = threading.Thread(
             target=self._stream_worker, args=(container,), daemon=True,
         )
         self.threads[name] = t
         t.start()
 
-        # 5. Фокус на новую вкладку
+        # 5 Фокус на новую вкладку
         self._show_tab(name)
 
         self._update_status()
@@ -498,13 +487,12 @@ class ModernLogReader(ctk.CTk):
 
         self._set_left_toggle_state(name, running=False)
 
-        # Служебная строка — только в массив (вкладка сейчас закроется)
+        # Служебная строка — только в массив 
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.logs.setdefault(name, []).append(
             f"--- {ts} ■ Стриминг остановлен ---"
         )
 
-        # Инвариант: нет стрима ⇒ нет вкладки
         self._close_tab(name)
         self._update_status()
 
@@ -552,9 +540,8 @@ class ModernLogReader(ctk.CTk):
             self.streams.pop(name, None)
             self.line_queue.put((name, None))
 
-    # =================================================================
     #  Разбор очереди
-    # =================================================================
+    
     def _drain_queue(self):
         processed = 0
         try:
@@ -596,9 +583,8 @@ class ModernLogReader(ctk.CTk):
         else:
             self.status_label.configure(text=f"Стримов нет. Всего строк: {total}")
 
-    # =================================================================
     #  Утилиты
-    # =================================================================
+
     def _shorten(self, text, max_len=18):
         return text if len(text) <= max_len else text[: max_len - 1] + "…"
 
@@ -627,9 +613,8 @@ class ModernLogReader(ctk.CTk):
         self.logs.clear()
         self.status_label.configure(text="Все превью и массивы очищены.")
 
-    # =================================================================
     #  Compose-панель
-    # =================================================================
+  
     def _open_compose_panel(self):
         try:
             from compose_panel import ComposePanel
@@ -645,8 +630,6 @@ class ModernLogReader(ctk.CTk):
             return
         self._compose_panel = ComposePanel(self)
 
-
-# =====================================================================
 if __name__ == "__main__":
     app = ModernLogReader()
     app.mainloop()
